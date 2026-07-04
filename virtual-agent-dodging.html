@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>虛擬黑點迴避測試</title>
+    <!-- 使用 Tailwind CSS 進行快速排版 -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- 引入 Google MediaPipe 的 Web 套件 -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        /* 讓 Canvas 水平翻轉，呈現照鏡子的直覺效果 */
+        #output_canvas {
+            transform: scaleX(-1);
+            max-width: 100%;
+            height: auto;
+            border-radius: 0.75rem;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.2);
+        }
+    </style>
+</head>
+<body class="bg-slate-900 text-white min-h-screen flex flex-col items-center justify-center p-4">
+
+    <div class="max-w-4xl w-full flex flex-col items-center gap-6">
+        
+        <div class="text-center space-y-2">
+            <h1 class="text-3xl font-bold tracking-wider text-emerald-400">具身智能概念驗證：手部避障</h1>
+            <p class="text-slate-400">請在瀏覽器提示中「允許」攝影機權限。將手靠近畫面中的黑點，觀察它的迴避行為。</p>
+        </div>
+
+        <!-- 狀態提示區 -->
+        <div id="loading" class="animate-pulse text-yellow-400 font-medium">
+            正在載入 MediaPipe AI 模型並啟動攝影機，請稍候...
+        </div>
+
+        <!-- 隱藏的 video 元素，用來獲取攝影機畫面 -->
+        <video id="input_video" class="hidden" playsinline></video>
+        
+        <!-- 顯示結果的 Canvas -->
+        <div class="relative w-full aspect-video bg-slate-800 rounded-xl flex items-center justify-center overflow-hidden border-2 border-slate-700">
+            <canvas id="output_canvas" width="1280" height="720" class="w-full h-full object-cover"></canvas>
+        </div>
+
+        <div class="flex gap-4 text-sm text-slate-500 bg-slate-800 py-2 px-4 rounded-full">
+            <span>物理參數：</span>
+            <span>迴避半徑 200px</span>
+            <span>|</span>
+            <span>最大速度 20</span>
+            <span>|</span>
+            <span>摩擦力 0.9</span>
+        </div>
+
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const loadingElement = document.getElementById('loading');
+
+        // 定義虛擬代理（黑點）的狀態與物理屬性
+        let dot = {
+            x: canvasElement.width / 2,
+            y: canvasElement.height / 2,
+            vx: 0,
+            vy: 0,
+            radius: 25,          // 黑點大小
+            maxSpeed: 20.0,      // 最大移動速度
+            friction: 0.9,       // 摩擦力 (讓黑點滑行後停下)
+            repelRadius: 200,    // 觸發迴避的警戒半徑 (像素)
+            repelForce: 3.0      // 迴避力度
+        };
+
+        // 更新黑點物理狀態的函式
+        function updateDotPhysics(handX, handY) {
+            if (handX !== null && handY !== null) {
+                // 計算手部與黑點之間的向量與距離
+                let dx = dot.x - handX;
+                let dy = dot.y - handY;
+                let distance = Math.sqrt(dx * dx + dy * dy);
+
+                // 如果手進入警戒範圍，產生排斥力
+                if (distance < dot.repelRadius && distance > 0) {
+                    // 距離越近，斥力越強
+                    let forceMagnitude = ((dot.repelRadius - distance) / dot.repelRadius) * dot.repelForce;
+                    let dirX = dx / distance;
+                    let dirY = dy / distance;
+                    
+                    dot.vx += dirX * forceMagnitude;
+                    dot.vy += dirY * forceMagnitude;
+                }
+            }
+
+            // 應用摩擦力
+            dot.vx *= dot.friction;
+            dot.vy *= dot.friction;
+
+            // 限制最大速度
+            let speed = Math.sqrt(dot.vx * dot.vx + dot.vy * dot.vy);
+            if (speed > dot.maxSpeed) {
+                dot.vx = (dot.vx / speed) * dot.maxSpeed;
+                dot.vy = (dot.vy / speed) * dot.maxSpeed;
+            }
+
+            // 更新位置
+            dot.x += dot.vx;
+            dot.y += dot.vy;
+
+            // 邊界碰撞偵測 (碰到邊緣時反彈)
+            if (dot.x - dot.radius < 0) {
+                dot.x = dot.radius;
+                dot.vx *= -0.5;
+            } else if (dot.x + dot.radius > canvasElement.width) {
+                dot.x = canvasElement.width - dot.radius;
+                dot.vx *= -0.5;
+            }
+
+            if (dot.y - dot.radius < 0) {
+                dot.y = dot.radius;
+                dot.vy *= -0.5;
+            } else if (dot.y + dot.radius > canvasElement.height) {
+                dot.y = canvasElement.height - dot.radius;
+                dot.vy *= -0.5;
+            }
+        }
+
+        // MediaPipe 處理每一幀結果的回呼函式
+        function onResults(results) {
+            // 模型載入成功，隱藏提示字眼
+            if (loadingElement.style.display !== 'none') {
+                loadingElement.style.display = 'none';
+            }
+
+            canvasCtx.save();
+            // 清空畫布
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            
+            // 繪製攝影機影像作為背景
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+            let handCenterX = null;
+            let handCenterY = null;
+
+            // 如果偵測到手部
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                for (const landmarks of results.multiHandLandmarks) {
+                    // 繪製手部骨架 (使用 MediaPipe 內建工具)
+                    drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 3});
+                    drawLandmarks(canvasCtx, landmarks, {color: '#FF0000', lineWidth: 2, radius: 3});
+
+                    // 取節點 9 (中指底部) 作為手的中心點
+                    // MediaPipe 回傳的座標是 0~1 的比例值，需乘上畫布尺寸
+                    handCenterX = landmarks[9].x * canvasElement.width;
+                    handCenterY = landmarks[9].y * canvasElement.height;
+
+                    // 繪製綠色警戒圈
+                    canvasCtx.beginPath();
+                    canvasCtx.arc(handCenterX, handCenterY, dot.repelRadius, 0, 2 * Math.PI);
+                    canvasCtx.strokeStyle = 'rgba(16, 185, 129, 0.5)'; // Tailwind Emerald-500 透明
+                    canvasCtx.lineWidth = 2;
+                    canvasCtx.stroke();
+                }
+            }
+
+            // 更新物理計算
+            updateDotPhysics(handCenterX, handCenterY);
+
+            // 繪製虛擬代理 (黑點)
+            canvasCtx.beginPath();
+            canvasCtx.arc(dot.x, dot.y, dot.radius, 0, 2 * Math.PI);
+            canvasCtx.fillStyle = '#111827'; // 深黑色
+            canvasCtx.fill();
+            
+            // 給黑點加個白邊讓它在深色背景下更顯眼
+            canvasCtx.lineWidth = 4;
+            canvasCtx.strokeStyle = '#FFFFFF';
+            canvasCtx.stroke();
+
+            canvasCtx.restore();
+        }
+
+        // 初始化 MediaPipe Hands
+        const hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+        
+        hands.setOptions({
+            maxNumHands: 1, // 只追蹤一隻手以維持效能
+            modelComplexity: 0, // 0 表示使用較輕量的模型，提高幀率
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.7
+        });
+        
+        hands.onResults(onResults);
+
+        // 初始化攝影機，並將影像送入 MediaPipe 進行運算
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: 1280,
+            height: 720
+        });
+        
+        // 啟動攝影機
+        camera.start();
+    </script>
+</body>
+</html>
